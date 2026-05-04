@@ -1,0 +1,6 @@
+yt-dlp>=2026.3.17
+webvtt-py>=0.5.1
+PyYAML>=6.0
+tenacity>=9.0
+python-slugify>=8.0
+youtube-transcript-api>=1.2
