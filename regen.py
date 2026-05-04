@@ -35,9 +35,12 @@ def regen_one(md_path: Path, raw_path: Path) -> tuple[int, int, bool]:
     fm = yaml.safe_load(md_text[3:end])
     body_after = md_text[end + 4:]
 
-    # extract chapter list from existing body if present
-    chapters = []
+    # extract chapter list (lines + structured) from existing body if present
+    chapter_lines = []
+    chapters_struct = []
     in_chapters = False
+    import re
+    chap_re = re.compile(r"-\s+(\d{1,2}:\d{2}(?::\d{2})?)\s+—\s+(.*)$")
     for line in body_after.splitlines():
         if line.strip() == "## Chapters":
             in_chapters = True
@@ -46,26 +49,22 @@ def regen_one(md_path: Path, raw_path: Path) -> tuple[int, int, bool]:
             if line.startswith("## "):
                 break
             if line.startswith("- "):
-                chapters.append(line)
+                chapter_lines.append(line)
+                m = chap_re.search(line)
+                if m:
+                    parts = m.group(1).split(":")
+                    if len(parts) == 2:
+                        sec = int(parts[0]) * 60 + int(parts[1])
+                    else:
+                        sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                    chapters_struct.append({"start_time": sec, "title": m.group(2).strip()})
 
     # rebuild segments + blocks with current logic
     rolling = extract.is_rolling_caption(raw_segments)
     segments = extract.dedup_rolling(raw_segments) if rolling else raw_segments
 
-    # we don't have raw chapter starts for make_blocks; reconstruct from chapter lines
-    chapter_starts = []
-    import re
-    for ch in chapters:
-        m = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)\s+—", ch)
-        if m:
-            parts = m.group(1).split(":")
-            if len(parts) == 2:
-                chapter_starts.append(int(parts[0]) * 60 + int(parts[1]))
-            elif len(parts) == 3:
-                chapter_starts.append(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
-
     blocks = extract.make_blocks(
-        segments, chapter_starts=chapter_starts, is_rolling_dedup=rolling
+        segments, chapters=chapters_struct, is_rolling_dedup=rolling
     )
 
     # rebuild frontmatter — keep most fields, update the changed ones
@@ -89,19 +88,23 @@ def regen_one(md_path: Path, raw_path: Path) -> tuple[int, int, bool]:
     lines.append(f"**Source**: {source} ({lang})")
     lines.append("")
 
-    if chapters:
+    if chapter_lines:
         lines.append("## Chapters")
-        lines.extend(chapters)
+        lines.extend(chapter_lines)
         lines.append("")
 
     lines.append("## Transcript")
     lines.append("")
-    split_desc = (
-        "split by chapter starts or 75s max-block (rolling-dedup auto VTT — "
-        "pause data is meaningless after dedup)"
-        if rolling
-        else "split by chapter starts, pauses >= 2.5s, or 75s max-block"
-    )
+    has_chapters = bool(chapters_struct)
+    if has_chapters:
+        split_desc = "one block per YouTube chapter"
+    elif rolling:
+        split_desc = (
+            "75s max-block (no chapters; rolling-dedup auto VTT — pause data "
+            "is meaningless after dedup)"
+        )
+    else:
+        split_desc = "no chapters; split by pauses >= 2.5s or 75s max-block"
     lines.append(
         f"_Source: **{source}** ({lang}). "
         f"{len(blocks)} blocks, {len(raw_segments)} raw segments. "
@@ -113,7 +116,9 @@ def regen_one(md_path: Path, raw_path: Path) -> tuple[int, int, bool]:
     for b in blocks:
         ts = extract.fmt_ts(b["start_sec"])
         text = " ".join(b["lines"]).strip()
-        lines.append(f"### [{ts}]")
+        chapter = b.get("chapter") or ""
+        header = f"### [{ts}] {chapter}".rstrip() if chapter else f"### [{ts}]"
+        lines.append(header)
         lines.append("")
         lines.append(text)
         lines.append("")

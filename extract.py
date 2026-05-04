@@ -126,40 +126,66 @@ def make_blocks(
     segments: list[dict],
     pause_threshold: float = 2.5,
     max_block_sec: float = 75.0,
-    chapter_starts: list[float] | None = None,
+    chapters: list[dict] | None = None,
     is_rolling_dedup: bool = False,
 ) -> list[dict]:
-    """Group segments into blocks. Boundaries placed at:
-    - chapter starts (if provided)
-    - pauses >= pause_threshold seconds (skipped if is_rolling_dedup, since
-      rolling-dedup cues are at regular cadence and pause data is meaningless)
-    - whenever current block has run for >= max_block_sec seconds
-    Blocks, NOT sentences — sentence boundaries are not inferred for ASR."""
+    """Group segments into blocks.
+    - When chapters are provided, each segment is assigned to the chapter that
+      contains its start time. Blocks split whenever consecutive segments belong
+      to different chapters. Each chapter ends up as exactly one block.
+    - When no chapters: split by pauses >= pause_threshold (skipped if
+      is_rolling_dedup since cues are regular-cadence) and by max_block_sec cap.
+    Blocks, NOT sentences — sentence boundaries are not inferred for ASR.
+
+    chapters format: [{"start_time": float, "title": str}, ...]
+    """
     if not segments:
         return []
-    if is_rolling_dedup:
+
+    chap_list = []
+    for ch in chapters or []:
+        st = ch.get("start_time")
+        if st is None:
+            continue
+        chap_list.append({"start": float(st), "title": ch.get("title") or ""})
+    chap_list.sort(key=lambda c: c["start"])
+
+    use_chapters = bool(chap_list)
+    if use_chapters:
         pause_threshold = float("inf")
-    chapter_set = sorted(set(chapter_starts or []))
+        max_block_sec = float("inf")
+    elif is_rolling_dedup:
+        pause_threshold = float("inf")
+
+    def chapter_for(t: float) -> str:
+        """Return the chapter title containing time t (last chapter whose start <= t)."""
+        title = ""
+        for c in chap_list:
+            if c["start"] <= t:
+                title = c["title"]
+            else:
+                break
+        return title
+
+    def new_block(seg: dict) -> dict:
+        return {
+            "start_sec": seg["start_sec"],
+            "end_sec": seg["end_sec"],
+            "lines": [seg["text"]],
+            "chapter": chapter_for(seg["start_sec"]) if use_chapters else "",
+        }
 
     blocks = []
-    current = {
-        "start_sec": segments[0]["start_sec"],
-        "end_sec": segments[0]["end_sec"],
-        "lines": [segments[0]["text"]],
-    }
+    current = new_block(segments[0])
     for seg in segments[1:]:
         gap = seg["start_sec"] - current["end_sec"]
         block_dur = current["end_sec"] - current["start_sec"]
-        chapter_split = any(
-            current["end_sec"] <= b <= seg["start_sec"] for b in chapter_set
+        chapter_changed = (
+            use_chapters and chapter_for(seg["start_sec"]) != current["chapter"]
         )
-        if chapter_split or gap >= pause_threshold or block_dur >= max_block_sec:
+        if chapter_changed or gap >= pause_threshold or block_dur >= max_block_sec:
             blocks.append(current)
-            current = {
-                "start_sec": seg["start_sec"],
-                "end_sec": seg["end_sec"],
-                "lines": [seg["text"]],
-            }
+            current = new_block(seg)
         else:
             current["end_sec"] = seg["end_sec"]
             current["lines"].append(seg["text"])
@@ -321,13 +347,8 @@ def write_outputs(
     raw_segments = parse_vtt_segments(sub_path)
     rolling = is_rolling_caption(raw_segments)
     segments = dedup_rolling(raw_segments) if rolling else raw_segments
-    chapter_starts = [
-        ch.get("start_time", 0)
-        for ch in (info.get("chapters") or [])
-        if ch.get("start_time") is not None
-    ]
     blocks = make_blocks(
-        segments, chapter_starts=chapter_starts, is_rolling_dedup=rolling
+        segments, chapters=info.get("chapters"), is_rolling_dedup=rolling
     )
 
     title = info.get("title") or info["id"]
@@ -378,12 +399,16 @@ def write_outputs(
 
     lines.append("## Transcript")
     lines.append("")
-    split_desc = (
-        "split by chapter starts or 75s max-block (rolling-dedup auto VTT — "
-        "pause data is meaningless after dedup)"
-        if rolling
-        else "split by chapter starts, pauses >= 2.5s, or 75s max-block"
-    )
+    has_chapters = bool(info.get("chapters"))
+    if has_chapters:
+        split_desc = "one block per YouTube chapter"
+    elif rolling:
+        split_desc = (
+            "75s max-block (no chapters; rolling-dedup auto VTT — pause data "
+            "is meaningless after dedup)"
+        )
+    else:
+        split_desc = "no chapters; split by pauses >= 2.5s or 75s max-block"
     note = (
         f"_Source: **{source}** ({lang}). "
         f"{len(blocks)} blocks, {len(raw_segments)} raw segments. "
@@ -396,7 +421,9 @@ def write_outputs(
     for b in blocks:
         ts = fmt_ts(b["start_sec"])
         text = " ".join(b["lines"]).strip()
-        lines.append(f"### [{ts}]")
+        chapter = b.get("chapter") or ""
+        header = f"### [{ts}] {chapter}".rstrip() if chapter else f"### [{ts}]"
+        lines.append(header)
         lines.append("")
         lines.append(text)
         lines.append("")
